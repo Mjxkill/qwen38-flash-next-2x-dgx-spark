@@ -1,0 +1,26 @@
+# 2026-09-03: the day-0 base was rebuilt upstream and ALREADY CONTAINS merged
+# PR #36845 (Triton packed-varlen QSA kernel — the long-context-safe path).
+# The only patch still required is the mrope partial-rotary OOB fix (unbounded
+# temporal mask -> OOB reads on every image call under CUDA graphs); the
+# kernel moved to kernels/ops/attention/rotary_triton.py.
+FROM lmsysorg/sglang:qwen38flashnext
+
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/sgl-workspace/sglang/python/sglang/kernels/ops/attention/rotary_triton.py")
+src = path.read_text()
+
+old = "t_mask = ~(h_mask | w_mask)"
+new = "t_mask = ~(h_mask | w_mask) & (cos_offsets < half_rd)"
+if new in src:
+    raise SystemExit("already patched; refusing to double-patch")
+if src.count(old) != 1:
+    raise SystemExit(f"expected exactly one unbounded t_mask, found {src.count(old)}; source drifted")
+for var in ("cos_offsets", "half_rd"):
+    if var not in src:
+        raise SystemExit(f"expected variable {var} missing; refusing to patch")
+
+path.write_text(src.replace(old, new))
+print(f"PATCHED {path}: bounded t_mask")
+PY
