@@ -1,0 +1,6 @@
+# nightly 0909 + patch PLE. Via docker build (et non docker commit) : commit
+# fige la config du conteneur de patch et écrase l'ENTRYPOINT NVIDIA — le head
+# Ray ne démarre alors jamais ("Ray head failed to become ready", 10/09).
+FROM eugr/spark-vllm:nightly-20260909
+COPY patch_ple.py /tmp/patch_ple.py
+RUN python3 /tmp/patch_ple.py

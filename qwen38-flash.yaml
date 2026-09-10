@@ -1,0 +1,43 @@
+recipe_version: '1'
+# Qwen 3.8-Flash-Next NVFP4 sur 2× DGX Spark — VALIDÉ 2026-09-10 : 26,5 tok/s @1M.
+# Archi Qwen4ExpForConditionalGeneration (préversion Qwen4) : présente dans la
+# nightly 2026090302 (vLLM 0.28.1). 125B + 51B n-gram, 6B actifs, vision incluse.
+# NVFP4 ~135 Go -> ~68 Go/nœud en TP=2 : grosse marge KV.
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: vllm-ray
+builder: eugr
+min_nodes: 2
+container: vllm-node
+cluster_only: true
+metadata:
+  description: Qwen 3.8-Flash-Next NVFP4 2 nœuds — 1M via YaRN x4, 26,5 tok/s
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.85
+  # 1M = extension YaRN officielle (natif 262144, factor 4.0 — model card Qwen).
+  # NB : PAS de --kv-cache-dtype fp8 — l'attention QSA de Qwen4Exp exige un KV bf16
+  # (NotImplementedError sinon, constaté nightly 2026090302).
+  max_model_len: 1048576
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+env:
+  VLLM_USE_BREAKABLE_CUDAGRAPH: '1'
+  NCCL_DEBUG: 'INFO'
+  NCCL_DEBUG_SUBSYS: 'INIT,NET'
+command: |
+  vllm serve RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+      --served-model-name qwen3.8-flash-next \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --max-model-len {max_model_len} \
+      --hf-overrides '{"text_config":{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}' \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --chat-template-kwargs '{"enable_thinking": false}' \
+      --distributed-executor-backend ray

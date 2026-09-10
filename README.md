@@ -4,9 +4,62 @@ Running [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen
 (180B hybrid MoE, 6B active, vision, native 262K context) on **two NVIDIA DGX Spark
 (GB10, SM121)** linked by a 200G RoCE cable, TP=2, via **SGLang**.
 
-This repo documents the **corruption-safe** kernel path and, as far as we know, the
-first published benchmark numbers for it on this hardware. TL;DR: **it works, quality
-is clean, but decode is 10–14 tok/s** — the price of correctness on SM121 today.
+Two working paths are documented here, both at full context and neither using the
+kernel that corrupts long context on SM121: **vLLM at 26.5 tok/s with a 1M-token
+context** (added 2026-09-10, needs one small patch) and **SGLang at 10–14 tok/s**
+(262K). As far as we know these are the first published numbers for either on this
+hardware.
+
+## Update 2026-09-10 — the vLLM path now works, and it is ~2× faster
+
+The vLLM route that was a dead end on 2026-09-03 (see trap #4 below) now runs,
+on the `eugr/spark-vllm:nightly-20260909` nightly plus **one local patch**:
+
+| Path | Decode | Context | Notes |
+|---|---|---|---|
+| **vLLM 0.28.1 nightly + PLE patch** | **26.5 tok/s** | **1,048,576** (YaRN ×4) | this section |
+| SGLang, safe QSA kernel | 10–14 tok/s | 262,144 | rest of this repo |
+| SGLang, TRT-LLM kernel | 50–70 tok/s | corrupts >120K | do not use |
+
+Same hardware (2× DGX Spark, GB10/SM121, TP=2 over 200G RoCE), same NVFP4
+checkpoint. Files: `Dockerfile.vllm`, `patch_ple.py`, `qwen38-flash.yaml`.
+
+### The one patch you still need
+
+Upstream's fix for [vllm #54765](https://github.com/vllm-project/vllm/issues/54765)
+landed but is **incomplete**: it only handles `ModelOptMixedPrecisionConfig`.
+This checkpoint carries a plain `ModelOptNvFp4Config` whose `quantization_config`
+lists the PLE n-gram table under `ignore` **while the checkpoint quantizes it to
+FP8 anyway** (the `ngram_embedding.weight_scale` tensor is right there in the
+index). So the loader still builds a plain embedding, registers no
+`weight_scale`, and dies at shard 203/206. `patch_ple.py` selects the FP8
+embedding method for ModelOpt NVFP4 configs; `Dockerfile.vllm` applies it.
+
+**Build it with `docker build`, never `docker commit`.** A commit freezes the
+patch container's config and overwrites the image's `ENTRYPOINT`
+(`/opt/nvidia/nvidia_entrypoint.sh`), after which the Ray head never becomes
+ready and sparkrun reports only "Ray head failed to become ready". Rebuild the
+image on each node from the same 3-line Dockerfile rather than shipping 27 GB
+over the wire.
+
+### Config gotchas (vLLM 0.28)
+
+- **1M context**: `--rope-scaling` no longer exists. Use `--hf-overrides`, and
+  **nest the override under `text_config`** — this is a multimodal model, so a
+  top-level `rope_scaling` is ignored and vLLM still derives 262144, then
+  refuses your `--max-model-len 1048576`.
+- **KV cache must be bf16**: `--kv-cache-dtype fp8` is rejected outright
+  (`Qwen4Exp QSA requires a BF16 main KV cache`). At 1M that is a 96 GB KV pool.
+- **Thinking is on by default** and leaks into answers ("We need answer user's
+  request in French: ..."). Pass `--chat-template-kwargs '{"enable_thinking":
+  false}'` at serve time, or `chat_template_kwargs` per request.
+- **Free-memory check**: the engine wants `gpu_memory_utilization × 121 GB` free
+  *at startup*. On GB10's unified memory anything else resident counts — a
+  leftover ComfyUI on the second node (11 GB) is enough to abort the launch with
+  "Free memory 88.15/121.63 GiB is less than desired". Kill other engines on
+  **both** nodes first.
+- **Never launch while a large rsync is running**: sparkrun's `sync` step blocks
+  on the dirty pages of the copy, silently, for tens of minutes.
 
 ## Why "safe path"?
 
@@ -42,9 +95,16 @@ badly written, SM121 simply has no validated fast path yet. Watch #36845 follow-
 
 ## Files
 
+vLLM path (faster, 1M context):
+- `Dockerfile.vllm` — nightly base + the PLE patch
+- `patch_ple.py` — the patch itself (self-checking; refuses to double-patch)
+- `qwen38-flash.yaml` — serve recipe (sparkrun-style; the `command:` block is a
+  plain `vllm serve` you can run by hand)
+
+SGLang path (262K):
 - `launch-cluster.sh` — orchestrator: cleanup, then worker (rank 1) and head (rank 0)
 - `sglang-node.sh` — per-node `docker run` with the full serve command
-- `Dockerfile.sm121` — the image: day-0 base + the one patch still needed (see trap #2)
+- `Dockerfile.sm121` — day-0 base + the mrope patch (see trap #2)
 
 ## Build
 
@@ -71,12 +131,13 @@ docker save qwen38fn:sm121 | ssh node2 docker load
    image bundles NCCL 2.30.7 and DeepEP hard-asserts on a duplicate NCCL runtime:
    `AssertionError: Duplicate NCCL runtime found`. Drop the preload and the mount.
 
-4. **The vLLM route is not usable today** (checked on a 0.28.1 nightly with NVIDIA's
-   fresh `qwen4_exp` implementation): (a) `--kv-cache-dtype fp8` is rejected — QSA
-   requires a BF16 main KV cache; (b) the ModelOpt NVFP4 checkpoint's FP8-quantized
-   PLE n-gram table fails to load ([vllm #54765](https://github.com/vllm-project/vllm/issues/54765));
-   (c) with (b) worked around, a device-side assert (`vectorized_gather_kernel: index
-   out of bounds`) fires during sampler warmup. We stopped there and moved to SGLang.
+4. **The vLLM route was a dead end for a week, and now is not** — see the
+   2026-09-10 section above. For the record, the three walls were: (a)
+   `--kv-cache-dtype fp8` rejected (QSA needs bf16); (b) the FP8 PLE n-gram table
+   failing to load ([vllm #54765](https://github.com/vllm-project/vllm/issues/54765),
+   still needs the local patch); (c) a device-side assert
+   (`vectorized_gather_kernel: index out of bounds`) during sampler warmup, which
+   the `skip_topk` MTP fix in the 2026-09-09 nightly cleared.
 
 5. **GB10 unified memory**: purge the model blobs from the Linux page cache before
    loading (posix_fadvise DONTNEED or `drop_caches`), or the GPU allocator starves.
