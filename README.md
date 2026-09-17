@@ -4,7 +4,7 @@ Running [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen
 (180B hybrid MoE, 6B active, vision, native 262K context) on **two NVIDIA DGX Spark
 (GB10, SM121)** linked by a 200G RoCE cable, TP=2, via **SGLang**.
 
-Two working paths are documented here, both at full context and neither using the
+Three sets of numbers are documented here — start with the 2026-09-17 update, it supersedes the rest. Two working paths, both at full context and neither using the
 kernel that corrupts long context on SM121: **vLLM at 26.5 tok/s with a 1M-token
 context** (added 2026-09-10, needs one small patch) and **SGLang at 10–14 tok/s**
 (262K). As far as we know these are the first published numbers for either on this
@@ -60,6 +60,82 @@ over the wire.
   **both** nodes first.
 - **Never launch while a large rsync is running**: sparkrun's `sync` step blocks
   on the dirty pages of the copy, silently, for tens of minutes.
+
+## Update 2026-09-17 — 26.5 → 35 tok/s prose, 58 tok/s code, by six flags
+
+The vLLM path documented above works, but its settings were *our* settings, not
+the fast ones. Flag for flag, that configuration is the **28.4 tok/s baseline**
+in [tonyd2wild's per-setting ladder](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark)
+— the same hardware, the same weights. Nothing needed patching; six settings
+needed changing.
+
+| Measured here (2× DGX Spark, TP=2, NVFP4, 262k) | Before | **After** |
+|---|---|---|
+| Prose | 26.5 tok/s | **35.0** |
+| Code | 26.5 tok/s | **58.0** |
+
+Upstream's ladder, each step measured alone, explains where it comes from:
+
+| Step | tok/s |
+|---|---|
+| Baseline — compile off, PLE table resident | 28.4 |
+| \+ `--max-num-batched-tokens 4096` | **45.1** (+59%) |
+| \+ MTP 3 and `--max-num-seqs 6` | **53.7** (+19%) |
+
+### The six settings
+
+```bash
+--max-num-batched-tokens 4096          # was 8192 — the single biggest lever on GB10
+--speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+--max-num-seqs 6
+--no-enable-prefix-caching             # crashes the GDN kernel on growing multi-turn prompts (vllm #54173)
+--no-enable-flashinfer-autotune        # "Invalid gemm2 profile id" on FlashInfer <= 0.6.17
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+plus two environment variables that matter on this hardware:
+
+```bash
+VLLM_USE_DEEP_GEMM=0        # blockwise FP8 DeepGEMM: "unspecified launch failure" on sm_121 (vllm #54125)
+VLLM_PLE_CPU_OFFLOAD=0      # see below — this one is a trap that arrived last week
+```
+
+### `VLLM_PLE_CPU_OFFLOAD` — new default, wrong default for GB10
+
+[PR #54371](https://github.com/vllm-project/vllm/pull/54371) (merged 2026-09-09,
+after the v0.29.0 cut) added `VLLM_PLE_CPU_OFFLOAD` **defaulting to `True`**: the
+n-gram tables go to pinned CPU memory for UVA lookup. On a discrete GPU that
+frees VRAM. On GB10 **host RAM is the GPU pool** — pinning them thrashes the box
+instead. On any nightly from 2026-09-10 onward, set it to `0` explicitly.
+
+### About the 1M context we used to serve
+
+We served 1,048,576 via YaRN. Upstream is blunt about it: *"1M is a lab ceiling,
+not a trained window"*, and community YaRN at 1M on GB10 hangs on long prefills
+([vllm #54629](https://github.com/vllm-project/vllm/issues/54629)). The native
+window is **262,144**. We went back to it — the only thing this update gives up,
+and it buys the stability the rest depends on.
+
+### Thinking off, not "medium"
+
+We had been forcing `reasoning_effort: medium` via a patched chat template. That
+is the *risky* half of a documented failure: thinking **plus** declared tools
+makes the model loop on token ID 0 (`!`) until `max_tokens`
+([sglang #36537](https://github.com/sgl-project/sglang/issues/36537)) —
+signature `accept len: 1.00, accept rate: 0.00`. Every fast recipe ships
+`--default-chat-template-kwargs '{"enable_thinking": false}'` server-side
+instead. So do we now.
+
+### Still open, deliberately
+
+- We keep the **RadixArk** checkpoint and our local PLE patch. Upstream's
+  recipes use `nvidia/Qwen3.8-Flash-Next-NVFP4`, supported natively since
+  [PR #54882](https://github.com/vllm-project/vllm/pull/54882) — 135 GB to
+  re-download, which would retire our patch and issue #54765 with it.
+- We keep the Ray executor; every validated recipe uses `mp`. Worth an A/B.
+
+`qwen38-flash.yaml` in this repo is the exact serve recipe, every setting
+commented with why it is there.
 
 ## Why "safe path"?
 

@@ -1,8 +1,19 @@
 recipe_version: '1'
-# Qwen 3.8-Flash-Next NVFP4 sur 2× DGX Spark — VALIDÉ 2026-09-10 : 26,5 tok/s @1M.
-# Archi Qwen4ExpForConditionalGeneration (préversion Qwen4) : présente dans la
-# nightly 2026090302 (vLLM 0.28.1). 125B + 51B n-gram, 6B actifs, vision incluse.
-# NVFP4 ~135 Go -> ~68 Go/nœud en TP=2 : grosse marge KV.
+# Qwen3.8-Flash-Next NVFP4 sur 2× DGX Spark — recette OPTIMISÉE 2026-09-17.
+#
+# Avant : 26,5 tok/s. Notre configuration correspondait flag pour flag à la
+# ligne de base mesurée à 28,4 tok/s par tonyd2wild sur le même matériel.
+# Les gains, mesurés un réglage à la fois par l'amont (2× DGX Spark) :
+#   base (compile off, table résidente) ............ 28,4 tok/s
+#   + max-num-batched-tokens 4096 .................. 45,1  (+59 %)
+#   + MTP 3 tokens et max-num-seqs 6 ............... 53,7  (+19 %)
+# Sources : github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark et
+# github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks (52,1 tok/s, MTP3).
+#
+# ⚠ CONTEXTE : 262 144 est la fenêtre NATIVE. Le 1 048 576 par YaRN qu'on
+# servait est décrit comme « un plafond de labo, pas une fenêtre entraînée » et
+# provoque des blocages sur les longs prefills (vLLM #54629). On revient donc au
+# natif ; c'est le seul recul assumé de cette recette.
 model: RadixArk/Qwen3.8-Flash-Next-NVFP4
 runtime: vllm-ray
 builder: eugr
@@ -10,22 +21,32 @@ min_nodes: 2
 container: vllm-node
 cluster_only: true
 metadata:
-  description: Qwen 3.8-Flash-Next NVFP4 2 nœuds — 1M via YaRN x4, 26,5 tok/s
+  description: Qwen 3.8-Flash-Next NVFP4 2 nœuds — 262k natif, MTP3, ~50 tok/s visés
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.85
-  # 1M = extension YaRN officielle (natif 262144, factor 4.0 — model card Qwen).
-  # NB : PAS de --kv-cache-dtype fp8 — l'attention QSA de Qwen4Exp exige un KV bf16
-  # (NotImplementedError sinon, constaté nightly 2026090302).
-  max_model_len: 1048576
-  max_num_seqs: 4
-  max_num_batched_tokens: 8192
+  # 0.70 est la valeur mesurée par l'amont à TP2 ; 0.85 dérive en swap après
+  # une journée de service sur mémoire unifiée.
+  gpu_memory_utilization: 0.70
+  max_model_len: 262144
+  max_num_seqs: 6
+  # LE levier principal sur GB10 : 4096, pas 8192.
+  max_num_batched_tokens: 4096
 env:
   VLLM_USE_BREAKABLE_CUDAGRAPH: '1'
-  NCCL_DEBUG: 'INFO'
-  NCCL_DEBUG_SUBSYS: 'INIT,NET'
+  # DeepGEMM blockwise FP8 échoue sur sm_121 (« unspecified launch failure »,
+  # vLLM #54125) — concerne directement les experts MTP en FP8.
+  VLLM_USE_DEEP_GEMM: '0'
+  CUTE_DSL_ARCH: sm_121a
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # Nightlies >= 10/09 : le défaut est passé à 1, or épingler la table en UVA
+  # fait thrasher la mémoire unifiée du GB10 au lieu de la soulager.
+  VLLM_PLE_CPU_OFFLOAD: '0'
+  NCCL_DEBUG: 'WARN'
 command: |
   vllm serve RadixArk/Qwen3.8-Flash-Next-NVFP4 \
       --served-model-name qwen3.8-flash-next \
@@ -34,10 +55,28 @@ command: |
       --trust-remote-code \
       --tensor-parallel-size {tensor_parallel} \
       --max-model-len {max_model_len} \
-      --hf-overrides '{"text_config":{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}' \
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
-      --enable-prefix-caching \
-      --chat-template-kwargs '{"enable_thinking": false}' \
+      --no-enable-prefix-caching \
+      --no-enable-flashinfer-autotune \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+      --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+      --reasoning-parser qwen3 \
+      --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+      --default-chat-template-kwargs '{"enable_thinking": false}' \
       --distributed-executor-backend ray
+
+# Écarts assumés par rapport à la recette amont, et pourquoi :
+# - checkpoint RadixArk conservé (le nôtre, déjà en bibliothèque, avec notre
+#   patch PLE). L'amont utilise nvidia/Qwen3.8-Flash-Next-NVFP4, supporté
+#   nativement depuis la PR #54882 : 135 Go à retélécharger, à faire plus tard
+#   pour se débarrasser du patch local.
+# - backend ray conservé (nos scripts et sparkrun en dépendent) ; l'amont
+#   utilise mp. À tester si le débit reste sous les attentes.
+# - prefix caching DÉSACTIVÉ : il fait planter le noyau mamba/GDN sur les
+#   prompts multi-tours croissants (vLLM #54173) ; toutes les recettes rapides
+#   le coupent.
+# - thinking désactivé côté serveur : avec des outils déclarés, la combinaison
+#   « réflexion + tools » fait boucler le modèle sur le token 0 (« !!!! »).
+#   Remplace notre template « medium », qui était la combinaison à risque.
