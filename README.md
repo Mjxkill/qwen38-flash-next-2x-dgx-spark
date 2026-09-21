@@ -10,6 +10,31 @@ context** (added 2026-09-10, needs one small patch) and **SGLang at 10–14 tok/
 (262K). As far as we know these are the first published numbers for either on this
 hardware.
 
+## Heads-up 2026-09-21 — the QSA indexer OOM has a Qwen3.8 instance, and a one-line workaround
+
+Not ours and not yet verified here, but it targets exactly this configuration
+and costs nothing to try. **[vllm #56457](https://github.com/vllm-project/vllm/issues/56457)**
+(opened 2026-09-11) reports the QSA indexer's per-chunk logits buffer growing
+with `max_seq_len` on GB10 until it OOMs or hangs — reproducibly at 166,400
+computed tokens, on 2 nodes at TP=2, fp8 KV, 262k context, with *this* NVFP4
+checkpoint. The reporter's workaround is one environment variable:
+
+```bash
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64
+```
+
+and they report it **also gains roughly 10 % decode**. That is their
+measurement, not ours — we have not re-run the ladder below with it.
+
+Same root cause as [#55569](https://github.com/vllm-project/vllm/issues/55569)
+(GLM-5.3-Flash, 2026-09-06). Neither is fixed upstream: the first patch
+([#55572](https://github.com/vllm-project/vllm/pull/55572)) was **closed
+without merging** on 2026-09-07, and the current candidate
+([#57105](https://github.com/vllm-project/vllm/pull/57105), 2026-09-16 —
+reserving the worst-case workspace up front, 55 segments/13.5 GB down to
+3 segments/534 MiB on GB10) is still open. If you run long contexts here, set
+the variable rather than wait for a release.
+
 ## Update 2026-09-10 — the vLLM path now works, and it is ~2× faster
 
 The vLLM route that was a dead end on 2026-09-03 (see trap #4 below) now runs,
